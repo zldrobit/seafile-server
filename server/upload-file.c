@@ -35,6 +35,7 @@ enum RecvState {
     RECV_HEADERS,
     RECV_CONTENT,
     RECV_ERROR,
+    RECV_END,
 };
 
 enum UploadError {
@@ -69,6 +70,7 @@ typedef struct RecvFSM {
     GList *files;               /* paths for completely uploaded tmp files. */
 
     gboolean recved_crlf; /* Did we recv a CRLF when write out the last line? */
+    gboolean recved_cr; /* Did we recv a CR when write out the last line? */
     char *file_name;
     char *tmp_file; /* tmp file path for the currently uploading file */
     int fd;
@@ -2027,12 +2029,14 @@ add_uploaded_file (RecvFSM *fsm)
         fsm->file_name = NULL;
         fsm->tmp_file = NULL;
         fsm->recved_crlf = FALSE;
+        fsm->recved_cr = FALSE;
     } else {
         fsm->filenames = g_list_prepend (fsm->filenames,
                                          get_basename(fsm->file_name));
         g_free (fsm->file_name);
         fsm->file_name = NULL;
         fsm->recved_crlf = FALSE;
+        fsm->recved_cr = FALSE;
     }
 
     return EVHTP_RES_OK;
@@ -2069,7 +2073,8 @@ recv_file_data (RecvFSM *fsm, gboolean *no_line)
                 }
                 g_free (fsm->input_name);
                 fsm->input_name = NULL;
-                fsm->state = RECV_HEADERS;
+                // avoid empty mime header line just before CRLF in RECV_HEADERS
+                fsm->state = RECV_END;
             } else {
                 seaf_debug ("[upload] recv file data %d bytes.\n", size);
                 if (fsm->recved_crlf) {
@@ -2078,7 +2083,20 @@ recv_file_data (RecvFSM *fsm, gboolean *no_line)
                                    strerror(errno));
                         return EVHTP_RES_SERVERR;
                     }
+                } else if (fsm->recved_cr) {
+                    if (writen (fsm->fd, "\r", 1) < 0) {
+                        seaf_warning ("[upload] Failed to write temp file: %s.\n",
+                                   strerror(errno));
+                        return EVHTP_RES_SERVERR;
+                    }
                 }
+
+                if (buf[size - 1] == '\r') {
+                    fsm->recved_cr = TRUE;
+                    size -= 1;
+                }
+                else
+                    fsm->recved_cr = FALSE;
                 if (writen (fsm->fd, buf, size) < 0) {
                     seaf_warning ("[upload] Failed to write temp file: %s.\n",
                                strerror(errno));
@@ -2111,6 +2129,12 @@ recv_file_data (RecvFSM *fsm, gboolean *no_line)
                            strerror(errno));
                 return EVHTP_RES_SERVERR;
             }
+        } else if (fsm->recved_cr) {
+            if (writen (fsm->fd, "\r", 1) < 0) {
+                seaf_warning ("[upload] Failed to write temp file: %s.\n",
+                           strerror(errno));
+                return EVHTP_RES_SERVERR;
+            }
         }
         if (writen (fsm->fd, line, len) < 0) {
             seaf_warning ("[upload] Failed to write temp file: %s.\n",
@@ -2120,6 +2144,7 @@ recv_file_data (RecvFSM *fsm, gboolean *no_line)
         }
         free (line);
         fsm->recved_crlf = TRUE;
+        fsm->recved_cr = FALSE;
     }
 
     return EVHTP_RES_OK;
@@ -2227,6 +2252,14 @@ upload_read_cb (evhtp_request_t *req, evbuf_t *buf, void *arg)
             if (res != EVHTP_RES_OK)
                 goto out;
 
+            break;
+        case RECV_END:
+            seaf_debug ("[upload] optional RECV_END.\n");
+            line = evbuffer_readln (fsm->line, &len, EVBUFFER_EOL_CRLF_STRICT);
+            if (line != NULL) {
+                free (line);
+            }
+            no_line = TRUE;
             break;
         }
     }
